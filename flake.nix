@@ -58,13 +58,17 @@
             ];
           };
 
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # Tests can't compile with panic=abort in release profile
+          cargoArtifacts = craneLib.buildDepsOnly (
+            commonArgs // { doCheck = false; }
+          );
         in
         craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
-            doCheck = true;
+            # Tests can't compile with panic=abort in release profile
+            doCheck = false;
 
             meta = {
               description = "Setuid+setgid binary for tamper-proof SSH session recording";
