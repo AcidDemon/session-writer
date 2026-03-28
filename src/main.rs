@@ -22,10 +22,8 @@ const MAX_USERNAME: usize = 64;
 const MAX_SUFFIX: usize = 32;
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB per session
 
-const SAFE_ID_CHARS: &str =
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-";
-const SAFE_SUFFIX_CHARS: &str =
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.";
+const SAFE_ID_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-";
+const SAFE_SUFFIX_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.";
 
 // ---------------------------------------------------------------------------
 // Security initialization
@@ -105,8 +103,8 @@ fn validate(input: &str, max_len: usize, allowed: &str, label: &str) -> Result<(
 
 /// Validate that a path resolves to a real directory inside STORAGE_DIR.
 fn validate_directory(path: &Path) -> Result<(), String> {
-    let resolved = fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve '{}': {e}", path.display()))?;
+    let resolved =
+        fs::canonicalize(path).map_err(|e| format!("cannot resolve '{}': {e}", path.display()))?;
 
     // Path::starts_with checks component boundaries, so
     // "/var/log/ssh-sessions-evil" will NOT match "/var/log/ssh-sessions".
@@ -116,8 +114,7 @@ fn validate_directory(path: &Path) -> Result<(), String> {
 
     // canonicalize() already resolved all symlinks, so the resolved path
     // itself cannot be a symlink. We only need to confirm it is a directory.
-    let meta = fs::symlink_metadata(&resolved)
-        .map_err(|e| format!("cannot stat: {e}"))?;
+    let meta = fs::symlink_metadata(&resolved).map_err(|e| format!("cannot stat: {e}"))?;
     if !meta.is_dir() {
         return Err(format!("'{}' is not a directory", path.display()));
     }
@@ -132,9 +129,9 @@ fn ensure_user_dir(username: &str) -> Result<PathBuf, String> {
     let dir = PathBuf::from(format!("{STORAGE_DIR}/{username}"));
 
     // Use DirBuilder to pass the mode directly to mkdir(2).
-    // This avoids the TOCTOU between create_dir() and set_permissions().
+    // The parent dirs setgid bit auto-inherits to subdirectories
     let mut builder = fs::DirBuilder::new();
-    builder.mode(0o2750);
+    builder.mode(0o0750);
 
     match builder.create(&dir) {
         Ok(()) => Ok(dir),
@@ -176,9 +173,7 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!("{} requires a value", args[i]));
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "Usage: session-writer --session-id <ID> [--suffix <SUFFIX>]"
-                );
+                eprintln!("Usage: session-writer --session-id <ID> [--suffix <SUFFIX>]");
                 eprintln!("Username is resolved automatically from the calling process UID.");
                 process::exit(0);
             }
@@ -204,7 +199,12 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let username = resolve_caller_username()?;
 
-    validate(&args.session_id, MAX_SESSION_ID, SAFE_ID_CHARS, "session-id")?;
+    validate(
+        &args.session_id,
+        MAX_SESSION_ID,
+        SAFE_ID_CHARS,
+        "session-id",
+    )?;
     validate(&username, MAX_USERNAME, SAFE_ID_CHARS, "username")?;
 
     if !args.suffix.starts_with('.') {
@@ -233,12 +233,8 @@ fn run() -> Result<(), String> {
     // Open the user directory with O_DIRECTORY | O_NOFOLLOW to get a
     // race-free file descriptor. This prevents TOCTOU attacks where the
     // directory is replaced with a symlink between validation and file open.
-    let dir_cstr = CString::new(
-        user_dir
-            .to_str()
-            .ok_or("user directory path not UTF-8")?,
-    )
-    .map_err(|_| "directory path contains null byte")?;
+    let dir_cstr = CString::new(user_dir.to_str().ok_or("user directory path not UTF-8")?)
+        .map_err(|_| "directory path contains null byte")?;
 
     let dir_fd = unsafe {
         libc::open(
