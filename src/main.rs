@@ -1,11 +1,11 @@
-// Setuid+setgid binary for tamper-proof SSH session recording.
+// katagrapho — Setuid+setgid binary for tamper-proof session recording.
 //
-// Reads stdin, writes to /var/log/ssh-sessions/<user>/<session-id><suffix>.
+// Reads asciicinema data from stdin, optionally encrypts with age, and writes
+// to /var/log/ssh-sessions/<user>/<session-id><suffix>.
+//
 // The binary runs setuid as a dedicated "session-writer" user and setgid as
 // "ssh-sessions". Files are therefore owned by session-writer:ssh-sessions
 // with mode 0440 — the recorded user cannot modify or delete them.
-//
-// Single dependency (libc) for correct syscall constants and user lookup.
 
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -428,7 +428,7 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(msg) = run() {
-        eprintln!("session-writer: {msg}");
+        eprintln!("katagrapho: {msg}");
         process::exit(1);
     }
 }

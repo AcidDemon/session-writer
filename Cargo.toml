@@ -1,8 +1,8 @@
 [package]
-name = "session-writer"
-version = "0.2.0"
+name = "katagrapho"
+version = "0.3.0"
 edition = "2024"
-description = "Setgid+setuid binary for tamper-proof SSH session recording"
+description = "Setgid+setuid binary for tamper-proof session recording with age encryption"
 license = "MIT"
 
 [dependencies]
