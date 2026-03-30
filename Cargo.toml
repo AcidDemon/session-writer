@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2"
+age = { version = "0.11", default-features = false }
 
 [profile.release]
 opt-level = "s"

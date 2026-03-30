@@ -150,12 +150,16 @@ fn ensure_user_dir(username: &str) -> Result<PathBuf, String> {
 struct Args {
     session_id: String,
     suffix: String,
+    recipient_file: Option<String>,
+    no_encrypt: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = std::env::args().collect();
     let mut session_id = None;
-    let mut suffix = String::from(".cast.age");
+    let mut suffix: Option<String> = None;
+    let mut recipient_file: Option<String> = None;
+    let mut no_encrypt = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -166,15 +170,27 @@ fn parse_args() -> Result<Args, String> {
             }
             "--suffix" if i + 1 < args.len() => {
                 i += 1;
-                suffix = args[i].clone();
+                suffix = Some(args[i].clone());
+            }
+            "--recipient-file" if i + 1 < args.len() => {
+                i += 1;
+                recipient_file = Some(args[i].clone());
+            }
+            "--no-encrypt" => {
+                no_encrypt = true;
             }
             // Known flags without a following value.
-            "--session-id" | "--suffix" => {
+            "--session-id" | "--suffix" | "--recipient-file" => {
                 return Err(format!("{} requires a value", args[i]));
             }
             "--help" | "-h" => {
-                eprintln!("Usage: session-writer --session-id <ID> [--suffix <SUFFIX>]");
+                eprintln!("Usage: katagrapho --session-id <ID> (--recipient-file <FILE> | --no-encrypt) [--suffix <SUFFIX>]");
                 eprintln!("Username is resolved automatically from the calling process UID.");
+                eprintln!();
+                eprintln!("  --session-id <ID>         Session identifier (required)");
+                eprintln!("  --recipient-file <FILE>   Path to age recipients file (required unless --no-encrypt)");
+                eprintln!("  --no-encrypt              Disable encryption; write plaintext .cast file");
+                eprintln!("  --suffix <SUFFIX>         Override output file suffix (default: .cast.age or .cast with --no-encrypt)");
                 process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -182,9 +198,17 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
 
+    let default_suffix = if no_encrypt {
+        String::from(".cast")
+    } else {
+        String::from(".cast.age")
+    };
+
     Ok(Args {
         session_id: session_id.ok_or("--session-id required")?,
-        suffix,
+        suffix: suffix.unwrap_or(default_suffix),
+        recipient_file,
+        no_encrypt,
     })
 }
 
@@ -197,6 +221,17 @@ fn run() -> Result<(), String> {
     set_umask();
 
     let args = parse_args()?;
+
+    if !args.no_encrypt && args.recipient_file.is_none() {
+        return Err(
+            "--recipient-file is required (use --no-encrypt to explicitly disable encryption)"
+                .to_string(),
+        );
+    }
+    if args.no_encrypt && args.recipient_file.is_some() {
+        return Err("--no-encrypt and --recipient-file are mutually exclusive".to_string());
+    }
+
     let username = resolve_caller_username()?;
 
     validate(
