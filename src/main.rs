@@ -183,6 +183,15 @@ fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, Stri
     Ok(total_read)
 }
 
+/// Attempt to write a termination marker to the recording.
+/// This is best-effort — if writing fails, we still want to preserve
+/// whatever partial data we have.
+fn write_termination_marker(writer: &mut dyn Write, reason: &str) {
+    // Use a fixed large elapsed time to ensure it sorts last.
+    let marker = format!("[999999.0, \"x\", {:?}]\n", reason);
+    let _ = writer.write_all(marker.as_bytes());
+}
+
 // ---------------------------------------------------------------------------
 // Directory management
 // ---------------------------------------------------------------------------
@@ -405,8 +414,13 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Err(e) => {
-            // Preserve partial file — do NOT delete.
-            // Partial evidence is better than none.
+            // Best-effort: write termination marker to the file.
+            // For unencrypted files, write directly. For encrypted,
+            // the encryption stream may be in a bad state, so skip.
+            if args.recipient_file.is_none() {
+                write_termination_marker(&mut file, &e);
+            }
+            let _ = file.sync_all();
             Err(e)
         }
     }
