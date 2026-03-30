@@ -122,6 +122,68 @@ fn validate_directory(path: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Encryption
+// ---------------------------------------------------------------------------
+
+/// Load age recipients (public keys) from a file.
+/// Each line is either an age public key or a comment (starting with #).
+fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, String> {
+    let contents =
+        fs::read_to_string(path).map_err(|e| format!("cannot read recipient file '{path}': {e}"))?;
+
+    let recipients: Vec<Box<dyn age::Recipient + Send>> = contents
+        .lines()
+        .filter(|l| {
+            let trimmed = l.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .map(|l| {
+            l.parse::<age::x25519::Recipient>()
+                .map(|r| Box::new(r) as Box<dyn age::Recipient + Send>)
+                .map_err(|_| format!("invalid age recipient: {l}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if recipients.is_empty() {
+        return Err(format!("no recipients found in '{path}'"));
+    }
+    Ok(recipients)
+}
+
+/// Stream stdin to the given writer with a size limit.
+/// Returns the total number of bytes read from stdin.
+fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, String> {
+    let mut buf = [0u8; BUF_SIZE];
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut total_read: u64 = 0;
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(format!("read: {e}"));
+            }
+        };
+
+        total_read += n as u64;
+        if total_read > MAX_FILE_SIZE {
+            return Err(format!(
+                "session exceeds maximum size ({MAX_FILE_SIZE} bytes)"
+            ));
+        }
+
+        if let Err(e) = writer.write_all(&buf[..n]) {
+            return Err(format!("write: {e}"));
+        }
+    }
+
+    Ok(total_read)
+}
+
+// ---------------------------------------------------------------------------
 // Directory management
 // ---------------------------------------------------------------------------
 
@@ -317,42 +379,37 @@ fn run() -> Result<(), String> {
     // SAFETY: file_fd is a valid, exclusively-owned file descriptor.
     let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
 
-    // Stream stdin to the file with a size limit.
-    let mut buf = [0u8; BUF_SIZE];
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut total_written: u64 = 0;
-
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                drop(file);
-                let _ = fs::remove_file(&output_path);
-                return Err(format!("read: {e}"));
-            }
-        };
-
-        total_written += n as u64;
-        if total_written > MAX_FILE_SIZE {
-            drop(file);
-            let _ = fs::remove_file(&output_path);
-            return Err(format!(
-                "session exceeds maximum size ({MAX_FILE_SIZE} bytes)"
-            ));
+    let result = if let Some(ref recipient_path) = args.recipient_file {
+        let recipients = load_recipients(recipient_path)?;
+        let recipients_ref: Vec<&dyn age::Recipient> =
+            recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient).collect();
+        let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
+        .map_err(|e| format!("encryption setup: {e}"))?;
+        let mut encrypt_writer = encryptor
+            .wrap_output(&mut file)
+            .map_err(|e| format!("encryption init: {e}"))?;
+        let res = stream_stdin(&mut encrypt_writer, &output_path);
+        if res.is_ok() {
+            encrypt_writer
+                .finish()
+                .map_err(|e| format!("encryption finalize: {e}"))?;
         }
+        res
+    } else {
+        stream_stdin(&mut file, &output_path)
+    };
 
-        if let Err(e) = file.write_all(&buf[..n]) {
-            drop(file);
-            let _ = fs::remove_file(&output_path);
-            return Err(format!("write: {e}"));
+    match result {
+        Ok(_) => {
+            file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+            Ok(())
+        }
+        Err(e) => {
+            // Preserve partial file — do NOT delete.
+            // Partial evidence is better than none.
+            Err(e)
         }
     }
-
-    file.sync_all().map_err(|e| format!("fsync: {e}"))?;
-    Ok(())
 }
 
 fn main() {
