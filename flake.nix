@@ -1,5 +1,5 @@
 {
-  description = "session-writer: setuid+setgid binary for tamper-proof SSH session recording";
+  description = "katagrapho: setuid+setgid binary for tamper-proof session recording with age encryption";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -37,7 +37,7 @@
       # edition = "2024" requires Rust >= 1.85.
       rustToolchainFor = pkgs: pkgs.rust-bin.stable.latest.minimal;
 
-      mkSessionWriter =
+      mkKatagrapho =
         pkgs:
         let
           rustToolchain = rustToolchainFor pkgs;
@@ -46,8 +46,8 @@
 
           commonArgs = {
             inherit src;
-            pname = "session-writer";
-            version = "0.2.0";
+            pname = "katagrapho";
+            version = "0.3.0";
             strictDeps = true;
 
             # Security hardening via linker flags.
@@ -71,23 +71,23 @@
             doCheck = false;
 
             meta = {
-              description = "Setuid+setgid binary for tamper-proof SSH session recording";
+              description = "katagrapho: setuid+setgid binary for tamper-proof session recording with age encryption";
               license = pkgs.lib.licenses.mit;
               platforms = pkgs.lib.platforms.linux;
-              mainProgram = "session-writer";
+              mainProgram = "katagrapho";
             };
           }
         );
     in
     {
       packages = forAllSystems (system: rec {
-        session-writer = mkSessionWriter (pkgsFor system);
-        default = session-writer;
+        katagrapho = mkKatagrapho (pkgsFor system);
+        default = katagrapho;
       });
 
       nixosModules = {
-        default = self.nixosModules.session-writer;
-        session-writer = import ./nixos-module.nix self;
+        default = self.nixosModules.katagrapho;
+        katagrapho = import ./nixos-module.nix self;
       };
 
       checks = forAllSystems (
@@ -103,16 +103,16 @@
 
           clippy = craneLib.cargoClippy {
             inherit src;
-            pname = "session-writer";
-            version = "0.2.0";
+            pname = "katagrapho";
+            version = "0.3.0";
             strictDeps = true;
             cargoClippyExtraArgs = "-- --deny warnings";
           };
 
           fmt = craneLib.cargoFmt {
             inherit src;
-            pname = "session-writer";
-            version = "0.2.0";
+            pname = "katagrapho";
+            version = "0.3.0";
           };
         }
       );
