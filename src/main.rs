@@ -71,19 +71,14 @@ fn close_inherited_fds() {
 /// Reset critical resource limits to prevent recording bypass.
 /// An attacker could set RLIMIT_FSIZE to truncate recordings or
 /// RLIMIT_NOFILE to prevent file opens.
-fn reset_resource_limits() {
+fn reset_resource_limits() -> Result<(), String> {
     let unlimited = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
-    // SAFETY: setrlimit is a standard syscall. Failure is non-fatal
-    // but means the caller's limits remain — we log and continue.
     unsafe {
         if libc::setrlimit(libc::RLIMIT_FSIZE, &unlimited) != 0 {
-            eprintln!(
-                "katagrapho: warning: cannot reset RLIMIT_FSIZE: {}",
-                io::Error::last_os_error()
-            );
+            return Err(format!("cannot reset RLIMIT_FSIZE: {}", io::Error::last_os_error()));
         }
     }
     let nofile = libc::rlimit {
@@ -92,12 +87,15 @@ fn reset_resource_limits() {
     };
     unsafe {
         if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
-            eprintln!(
-                "katagrapho: warning: cannot reset RLIMIT_NOFILE: {}",
-                io::Error::last_os_error()
-            );
+            return Err(format!("cannot reset RLIMIT_NOFILE: {}", io::Error::last_os_error()));
         }
     }
+    // Prevent core dumps leaking plaintext
+    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +383,7 @@ fn run() -> Result<(), String> {
     sanitize_environment();
     close_inherited_fds();
     set_umask();
-    reset_resource_limits();
+    reset_resource_limits()?;
     install_signal_handlers();
 
     let args = parse_args()?;
