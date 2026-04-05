@@ -14,6 +14,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const STORAGE_DIR: &str = "/var/log/ssh-sessions";
 const BUF_SIZE: usize = 65536;
@@ -30,25 +31,16 @@ const SAFE_SUFFIX_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 // ---------------------------------------------------------------------------
 
 /// Sanitize the process environment for setuid/setgid execution.
+/// Uses an allowlist approach — nuke everything, keep nothing.
 /// Must be called before any other work.
 fn sanitize_environment() {
-    // These variables can influence the dynamic linker or Rust runtime.
-    // While the kernel sets AT_SECURE for setuid/setgid binaries (causing
-    // glibc to ignore LD_* vars), we clear them defensively in case the
-    // binary is invoked through a code path that does not trigger AT_SECURE.
-    for key in &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
-        "LD_DEBUG",
-        "LD_PROFILE",
-        "LD_SHOW_AUXV",
-        "LD_DYNAMIC_WEAK",
-        "RUST_BACKTRACE",
-        "RUST_LOG",
-    ] {
-        // SAFETY: We are single-threaded at this point (start of main).
-        unsafe { std::env::remove_var(key) };
+    // Allowlist: this binary needs no environment variables at all.
+    // Clear everything to prevent GCONV_PATH, locale, LD_*, TMPDIR,
+    // HOSTALIASES, or any other variable from influencing behavior.
+    // SAFETY: We are single-threaded at this point (start of main).
+    let keys: Vec<String> = std::env::vars().map(|(k, _)| k).collect();
+    for key in keys {
+        unsafe { std::env::remove_var(&key) };
     }
 }
 
@@ -59,6 +51,76 @@ fn set_umask() {
     // SAFETY: umask is a trivial syscall that cannot fail.
     unsafe {
         libc::umask(0o027);
+    }
+}
+
+/// Close all inherited file descriptors above stderr.
+/// Prevents the caller from passing open fds that could leak data
+/// or be used to influence behavior of the setuid binary.
+fn close_inherited_fds() {
+    // SAFETY: close() on an invalid fd returns EBADF, which is harmless.
+    // We use a reasonable upper bound; /proc/self/fd iteration would be
+    // more precise but adds complexity for minimal gain.
+    for fd in 3..1024 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Reset critical resource limits to prevent recording bypass.
+/// An attacker could set RLIMIT_FSIZE to truncate recordings or
+/// RLIMIT_NOFILE to prevent file opens.
+fn reset_resource_limits() {
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: setrlimit is a standard syscall. Failure is non-fatal
+    // but means the caller's limits remain — we log and continue.
+    unsafe {
+        if libc::setrlimit(libc::RLIMIT_FSIZE, &unlimited) != 0 {
+            eprintln!(
+                "katagrapho: warning: cannot reset RLIMIT_FSIZE: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+    let nofile = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: 64,
+    };
+    unsafe {
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
+            eprintln!(
+                "katagrapho: warning: cannot reset RLIMIT_NOFILE: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
+
+static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
+}
+
+/// Install signal handlers so we can finalize encrypted streams on interruption.
+fn install_signal_handlers() {
+    // SAFETY: zeroed sigaction is a valid base; we then set the fields we need.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = signal_handler as *const () as usize;
+    sa.sa_flags = libc::SA_RESTART;
+    // SAFETY: sigaction with a valid handler and zeroed mask is safe.
+    unsafe {
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
     }
 }
 
@@ -133,14 +195,15 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, St
 
     let recipients: Vec<Box<dyn age::Recipient + Send>> = contents
         .lines()
-        .filter(|l| {
+        .enumerate()
+        .filter(|(_, l)| {
             let trimmed = l.trim();
             !trimmed.is_empty() && !trimmed.starts_with('#')
         })
-        .map(|l| {
+        .map(|(i, l)| {
             l.parse::<age::x25519::Recipient>()
                 .map(|r| Box::new(r) as Box<dyn age::Recipient + Send>)
-                .map_err(|_| format!("invalid age recipient: {l}"))
+                .map_err(|_| format!("invalid age recipient on line {}", i + 1))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -151,7 +214,7 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, St
 }
 
 /// Stream stdin to the given writer with a size limit.
-/// Returns the total number of bytes read from stdin.
+/// Returns Ok(bytes_read) on EOF, or Err with reason on failure/signal.
 fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, String> {
     let mut buf = [0u8; BUF_SIZE];
     let stdin = io::stdin();
@@ -159,10 +222,20 @@ fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, Stri
     let mut total_read: u64 = 0;
 
     loop {
+        if SIGNAL_RECEIVED.load(Ordering::Relaxed) {
+            return Err("interrupted by signal".to_string());
+        }
+
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                // Re-check signal flag on EINTR
+                if SIGNAL_RECEIVED.load(Ordering::Relaxed) {
+                    return Err("interrupted by signal".to_string());
+                }
+                continue;
+            }
             Err(e) => {
                 return Err(format!("read: {e}"));
             }
@@ -188,8 +261,29 @@ fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, Stri
 /// whatever partial data we have.
 fn write_termination_marker(writer: &mut dyn Write, reason: &str) {
     // Use a fixed large elapsed time to ensure it sorts last.
-    let marker = format!("[999999.0, \"x\", {:?}]\n", reason);
+    // Escape reason as a JSON string (RFC 8259).
+    let escaped = json_escape(reason);
+    let marker = format!("[999999.0, \"x\", \"{}\"]\n", escaped);
     let _ = writer.write_all(marker.as_bytes());
+}
+
+/// Minimal JSON string escaping per RFC 8259.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +383,10 @@ fn parse_args() -> Result<Args, String> {
 
 fn run() -> Result<(), String> {
     sanitize_environment();
+    close_inherited_fds();
     set_umask();
+    reset_resource_limits();
+    install_signal_handlers();
 
     let args = parse_args()?;
 
@@ -398,10 +495,12 @@ fn run() -> Result<(), String> {
             .wrap_output(&mut file)
             .map_err(|e| format!("encryption init: {e}"))?;
         let res = stream_stdin(&mut encrypt_writer, &output_path);
-        if res.is_ok() {
-            encrypt_writer
-                .finish()
-                .map_err(|e| format!("encryption finalize: {e}"))?;
+        // Always finalize the encryption stream so the file is decodable,
+        // even on signal interruption or error.
+        if let Err(e) = encrypt_writer.finish()
+            && res.is_ok()
+        {
+            return Err(format!("encryption finalize: {e}"));
         }
         res
     } else {
@@ -416,7 +515,7 @@ fn run() -> Result<(), String> {
         Err(e) => {
             // Best-effort: write termination marker to the file.
             // For unencrypted files, write directly. For encrypted,
-            // the encryption stream may be in a bad state, so skip.
+            // the stream is already finalized above.
             if args.recipient_file.is_none() {
                 write_termination_marker(&mut file, &e);
             }

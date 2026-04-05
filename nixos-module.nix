@@ -9,6 +9,9 @@ flakeSelf:
 }:
 let
   cfg = config.services.katagrapho;
+  # Hardcoded to match STORAGE_DIR in src/main.rs — no configurable option
+  # to prevent drift between the binary constant and the NixOS module.
+  storageDir = "/var/log/ssh-sessions";
   inherit (lib)
     mkEnableOption
     mkOption
@@ -38,15 +41,6 @@ in
       type = types.str;
       default = "session-writer";
       description = "Dedicated user that owns session recording files.";
-    };
-
-    storageDir = mkOption {
-      type = types.path;
-      default = "/var/log/ssh-sessions";
-      description = ''
-        Directory where session recordings are stored.
-        Must match the STORAGE_DIR constant in the binary.
-      '';
     };
 
     encryption = {
@@ -112,7 +106,7 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.storageDir} 2770 ${cfg.user} ${cfg.group} -"
+      "d ${storageDir} 2750 ${cfg.user} ${cfg.group} -"
     ];
 
     security.wrappers.katagrapho = {
@@ -128,9 +122,11 @@ in
       description = "Clean up old session recordings";
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${pkgs.findutils}/bin/find ${cfg.storageDir} -type f -mtime +${toString cfg.logRotation.maxAgeDays} -delete";
+        User = cfg.user;
+        Group = cfg.group;
+        ExecStart = "${pkgs.findutils}/bin/find ${storageDir} -xdev -type f -mtime +${toString cfg.logRotation.maxAgeDays} -delete";
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.storageDir ];
+        ReadWritePaths = [ storageDir ];
         ProtectHome = true;
         NoNewPrivileges = true;
         PrivateTmp = true;
